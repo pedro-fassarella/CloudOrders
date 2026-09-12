@@ -1,0 +1,22 @@
+## Build output
+[Bb]in/
+[Oo]bj/
+[Tt]est[Rr]esults/
+
+## Local development
+.vs/
+.idea/
+.vscode/
+.env
+*.user
+*.suo
+
+## Local tooling and generated database artifacts
+.tools/
+*.db
+*.sqlite
+
+## IDE and OS files
+*.userprefs
+.DS_Store
+Thumbs.db

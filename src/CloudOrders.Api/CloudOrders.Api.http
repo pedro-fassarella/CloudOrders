@@ -1,0 +1,18 @@
+@CloudOrders.Api_HostAddress = http://localhost:5049
+
+GET {{CloudOrders.Api_HostAddress}}/health
+Accept: application/json
+
+###
+
+POST {{CloudOrders.Api_HostAddress}}/orders
+Content-Type: application/json
+
+{
+  "customerId": "customer-123"
+}
+
+###
+
+POST {{CloudOrders.Api_HostAddress}}/messaging/probe
+Accept: application/json
