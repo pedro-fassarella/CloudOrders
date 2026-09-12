@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Text.Json;
 using CloudOrders.Application.Messaging;
+using CloudOrders.Application.Observability;
 
 namespace CloudOrders.Inventory.Worker;
 
@@ -18,69 +20,131 @@ internal sealed partial class InventoryMessageProcessor(
         string? contentType,
         Func<CancellationToken, Task> completeMessageAsync,
         Func<MessageDeadLetterDetails, CancellationToken, Task>? deadLetterMessageAsync = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int deliveryCount = 1)
     {
         ArgumentNullException.ThrowIfNull(completeMessageAsync);
         Guid? orderId = null;
+        var outcome = "failed";
+        string? settlement = null;
+        var startedAt = Stopwatch.GetTimestamp();
+
+        using var activity = CloudOrdersTelemetry.StartMessageProcessing(
+            ConsumerIdentities.Inventory,
+            messageId,
+            correlationId,
+            deliveryCount);
+        using var scope = CloudOrdersTelemetry.BeginMessageScope(
+            logger,
+            CloudOrdersTelemetry.InventoryWorkerServiceName,
+            ConsumerIdentities.Inventory,
+            messageId,
+            correlationId,
+            deliveryCount);
+
+        if (deliveryCount > 1)
+        {
+            CloudOrdersTelemetry.RecordRedelivery(ConsumerIdentities.Inventory);
+        }
 
         try
         {
-            if (string.IsNullOrWhiteSpace(messageId))
+            try
             {
-                throw new PermanentMessageFailureException(
-                    PermanentMessageFailureKind.ContractViolation,
-                    "The Service Bus message ID was missing.");
+                if (string.IsNullOrWhiteSpace(messageId))
+                {
+                    throw new PermanentMessageFailureException(
+                        PermanentMessageFailureKind.ContractViolation,
+                        "The Service Bus message ID was missing.");
+                }
+
+                ValidateMessageContract(subject, contentType);
+
+                if (body.IsEmpty)
+                {
+                    throw new PermanentMessageFailureException(
+                        PermanentMessageFailureKind.ContractViolation,
+                        "The OrderCreated message body was empty.");
+                }
+
+                var orderCreated = DeserializeOrderCreated(body);
+                orderId = orderCreated.OrderId;
+                CloudOrdersTelemetry.AddOrderId(activity, orderCreated.OrderId);
+                var execution = await processedMessageStore
+                    .ExecuteOnceAsync(
+                        ConsumerIdentities.Inventory,
+                        messageId,
+                        cancellationToken => inventoryProcessor.ProcessAsync(orderCreated, cancellationToken),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (execution.WasAlreadyProcessed)
+                {
+                    outcome = "duplicate";
+                    LogSkippedDuplicateInventoryMessage(orderCreated.OrderId, messageId, correlationId);
+                }
+                else
+                {
+                    outcome = "processed";
+                    var reservation = execution.Result
+                        ?? throw new InvalidOperationException("Inventory processing completed without a reservation.");
+
+                    LogProcessedInventoryReservation(
+                        orderCreated.OrderId,
+                        messageId,
+                        correlationId,
+                        reservation.ReservationReference);
+                }
             }
-
-            ValidateMessageContract(subject, contentType);
-
-            if (body.IsEmpty)
+            catch (PermanentMessageFailureException failure) when (deadLetterMessageAsync is not null)
             {
-                throw new PermanentMessageFailureException(
-                    PermanentMessageFailureKind.ContractViolation,
-                    "The OrderCreated message body was empty.");
-            }
-
-            var orderCreated = DeserializeOrderCreated(body);
-            orderId = orderCreated.OrderId;
-            var execution = await processedMessageStore
-                .ExecuteOnceAsync(
+                var details = MessageDeadLetterDetailsFactory.Create(
                     ConsumerIdentities.Inventory,
                     messageId,
-                    cancellationToken => inventoryProcessor.ProcessAsync(orderCreated, cancellationToken),
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            if (execution.WasAlreadyProcessed)
-            {
-                LogSkippedDuplicateInventoryMessage(orderCreated.OrderId, messageId, correlationId);
+                    failure);
+                settlement = "dead_letter";
+                await deadLetterMessageAsync(details, cancellationToken).ConfigureAwait(false);
+                CloudOrdersTelemetry.RecordMessageSettlement(
+                    ConsumerIdentities.Inventory,
+                    settlement,
+                    "succeeded");
+                CloudOrdersTelemetry.RecordMessageDeadLettered(ConsumerIdentities.Inventory, details.Reason);
+                outcome = "dead_lettered";
+                CloudOrdersTelemetry.SetOutcome(activity, outcome);
+                LogDeadLetteredInventoryMessage(orderId, messageId, correlationId, details.Reason);
+                return;
             }
-            else
-            {
-                var reservation = execution.Result
-                    ?? throw new InvalidOperationException("Inventory processing completed without a reservation.");
 
-                LogProcessedInventoryReservation(
-                    orderCreated.OrderId,
-                    messageId,
-                    correlationId,
-                    reservation.ReservationReference);
-            }
-        }
-        catch (PermanentMessageFailureException failure) when (deadLetterMessageAsync is not null)
-        {
-            var details = MessageDeadLetterDetailsFactory.Create(
+            settlement = "complete";
+            await completeMessageAsync(cancellationToken).ConfigureAwait(false);
+            CloudOrdersTelemetry.RecordMessageSettlement(
                 ConsumerIdentities.Inventory,
-                messageId,
-                failure);
-            await deadLetterMessageAsync(details, cancellationToken).ConfigureAwait(false);
-            LogDeadLetteredInventoryMessage(messageId, correlationId, details.Reason);
-            return;
+                settlement,
+                "succeeded");
+            CloudOrdersTelemetry.SetOutcome(activity, outcome);
+            LogCompletedInventoryMessage(orderId!.Value, messageId, correlationId);
         }
+        catch (Exception exception)
+        {
+            if (settlement is not null)
+            {
+                CloudOrdersTelemetry.RecordMessageSettlement(
+                    ConsumerIdentities.Inventory,
+                    settlement,
+                    "failed");
+            }
 
-        await completeMessageAsync(cancellationToken).ConfigureAwait(false);
-
-        LogCompletedInventoryMessage(orderId!.Value, messageId, correlationId);
+            CloudOrdersTelemetry.SetFailure(activity, exception);
+            LogInventoryProcessingFailed(exception, exception.GetType().Name, orderId);
+            throw;
+        }
+        finally
+        {
+            CloudOrdersTelemetry.RecordMessageProcessing(
+                ConsumerIdentities.Inventory,
+                outcome,
+                Stopwatch.GetElapsedTime(startedAt).TotalSeconds);
+        }
     }
 
     private static void ValidateMessageContract(string? subject, string? contentType)
@@ -140,8 +204,9 @@ internal sealed partial class InventoryMessageProcessor(
 
     [LoggerMessage(
         Level = LogLevel.Warning,
-        Message = "Dead-lettered inventory message {MessageId} with correlation {CorrelationId} and reason {DeadLetterReason}.")]
+        Message = "Dead-lettered inventory message {MessageId} for order {OrderId} with correlation {CorrelationId} and reason {DeadLetterReason}.")]
     private partial void LogDeadLetteredInventoryMessage(
+        Guid? orderId,
         string messageId,
         string? correlationId,
         string deadLetterReason);
@@ -153,4 +218,9 @@ internal sealed partial class InventoryMessageProcessor(
         Guid orderId,
         string messageId,
         string? correlationId);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Inventory message processing failed for order {OrderId} with {FailureType}.")]
+    private partial void LogInventoryProcessingFailed(Exception exception, string failureType, Guid? orderId);
 }

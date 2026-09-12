@@ -10,16 +10,16 @@
 6. `add-payment-worker`
 7. `add-inventory-worker`
 8. `add-notification-worker`
+9. `add-idempotent-consumers`
+10. `add-retry-and-dead-letter-handling`
+11. `add-observability` (including the local Azure Service Bus smoke test)
 
 ## Next
 
-9. `add-idempotent-consumers`
+12. `add-outbox-pattern`
 
 ## Planned
 
-10. `add-retry-and-dead-letter-handling`
-11. `add-observability`
-12. `add-outbox-pattern`
 13. `deploy-to-azure`
 14. `add-ci-cd`
 15. `add-infrastructure-as-code`

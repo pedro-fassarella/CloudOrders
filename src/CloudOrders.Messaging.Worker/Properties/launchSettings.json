@@ -5,7 +5,9 @@
       "commandName": "Project",
       "dotnetRunMessages": true,
       "environmentVariables": {
-        "DOTNET_ENVIRONMENT": "Development"
+        "DOTNET_ENVIRONMENT": "Development",
+        "ConnectionStrings__Postgres": "Host=localhost;Port=5432;Database=cloudorders;Username=cloudorders;Password=cloudorders_dev",
+        "AZURE_EXPERIMENTAL_ENABLE_ACTIVITY_SOURCE": "true"
       }
     }
   }

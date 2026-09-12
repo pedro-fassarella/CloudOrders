@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Text.Json;
 using CloudOrders.Application.Messaging;
+using CloudOrders.Application.Observability;
 
 namespace CloudOrders.Notification.Worker;
 
@@ -18,70 +20,132 @@ internal sealed partial class NotificationMessageProcessor(
         string? contentType,
         Func<CancellationToken, Task> completeMessageAsync,
         Func<MessageDeadLetterDetails, CancellationToken, Task>? deadLetterMessageAsync = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int deliveryCount = 1)
     {
         ArgumentNullException.ThrowIfNull(completeMessageAsync);
         Guid? orderId = null;
+        var outcome = "failed";
+        string? settlement = null;
+        var startedAt = Stopwatch.GetTimestamp();
+
+        using var activity = CloudOrdersTelemetry.StartMessageProcessing(
+            ConsumerIdentities.Notification,
+            messageId,
+            correlationId,
+            deliveryCount);
+        using var scope = CloudOrdersTelemetry.BeginMessageScope(
+            logger,
+            CloudOrdersTelemetry.NotificationWorkerServiceName,
+            ConsumerIdentities.Notification,
+            messageId,
+            correlationId,
+            deliveryCount);
+
+        if (deliveryCount > 1)
+        {
+            CloudOrdersTelemetry.RecordRedelivery(ConsumerIdentities.Notification);
+        }
 
         try
         {
-            if (string.IsNullOrWhiteSpace(messageId))
+            try
             {
-                throw new PermanentMessageFailureException(
-                    PermanentMessageFailureKind.ContractViolation,
-                    "The Service Bus message ID was missing.");
+                if (string.IsNullOrWhiteSpace(messageId))
+                {
+                    throw new PermanentMessageFailureException(
+                        PermanentMessageFailureKind.ContractViolation,
+                        "The Service Bus message ID was missing.");
+                }
+
+                ValidateMessageContract(subject, contentType);
+
+                if (body.IsEmpty)
+                {
+                    throw new PermanentMessageFailureException(
+                        PermanentMessageFailureKind.ContractViolation,
+                        "The OrderCreated message body was empty.");
+                }
+
+                var orderCreated = DeserializeOrderCreated(body);
+                orderId = orderCreated.OrderId;
+                CloudOrdersTelemetry.AddOrderId(activity, orderCreated.OrderId);
+                var execution = await processedMessageStore
+                    .ExecuteOnceAsync(
+                        ConsumerIdentities.Notification,
+                        messageId,
+                        cancellationToken => notificationProcessor.ProcessAsync(orderCreated, cancellationToken),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (execution.WasAlreadyProcessed)
+                {
+                    outcome = "duplicate";
+                    LogSkippedDuplicateNotification(orderCreated.OrderId, messageId, correlationId);
+                }
+                else
+                {
+                    outcome = "processed";
+                    var receipt = execution.Result
+                        ?? throw new InvalidOperationException("Notification processing completed without a receipt.");
+
+                    LogProcessedNotification(
+                        orderCreated.OrderId,
+                        messageId,
+                        correlationId,
+                        receipt.NotificationChannel,
+                        receipt.NotificationReference);
+                }
             }
-
-            ValidateMessageContract(subject, contentType);
-
-            if (body.IsEmpty)
+            catch (PermanentMessageFailureException failure) when (deadLetterMessageAsync is not null)
             {
-                throw new PermanentMessageFailureException(
-                    PermanentMessageFailureKind.ContractViolation,
-                    "The OrderCreated message body was empty.");
-            }
-
-            var orderCreated = DeserializeOrderCreated(body);
-            orderId = orderCreated.OrderId;
-            var execution = await processedMessageStore
-                .ExecuteOnceAsync(
+                var details = MessageDeadLetterDetailsFactory.Create(
                     ConsumerIdentities.Notification,
                     messageId,
-                    cancellationToken => notificationProcessor.ProcessAsync(orderCreated, cancellationToken),
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            if (execution.WasAlreadyProcessed)
-            {
-                LogSkippedDuplicateNotification(orderCreated.OrderId, messageId, correlationId);
+                    failure);
+                settlement = "dead_letter";
+                await deadLetterMessageAsync(details, cancellationToken).ConfigureAwait(false);
+                CloudOrdersTelemetry.RecordMessageSettlement(
+                    ConsumerIdentities.Notification,
+                    settlement,
+                    "succeeded");
+                CloudOrdersTelemetry.RecordMessageDeadLettered(ConsumerIdentities.Notification, details.Reason);
+                outcome = "dead_lettered";
+                CloudOrdersTelemetry.SetOutcome(activity, outcome);
+                LogDeadLetteredNotification(orderId, messageId, correlationId, details.Reason);
+                return;
             }
-            else
-            {
-                var receipt = execution.Result
-                    ?? throw new InvalidOperationException("Notification processing completed without a receipt.");
 
-                LogProcessedNotification(
-                    orderCreated.OrderId,
-                    messageId,
-                    correlationId,
-                    receipt.NotificationChannel,
-                    receipt.NotificationReference);
-            }
-        }
-        catch (PermanentMessageFailureException failure) when (deadLetterMessageAsync is not null)
-        {
-            var details = MessageDeadLetterDetailsFactory.Create(
+            settlement = "complete";
+            await completeMessageAsync(cancellationToken).ConfigureAwait(false);
+            CloudOrdersTelemetry.RecordMessageSettlement(
                 ConsumerIdentities.Notification,
-                messageId,
-                failure);
-            await deadLetterMessageAsync(details, cancellationToken).ConfigureAwait(false);
-            LogDeadLetteredNotification(messageId, correlationId, details.Reason);
-            return;
+                settlement,
+                "succeeded");
+            CloudOrdersTelemetry.SetOutcome(activity, outcome);
+            LogCompletedNotification(orderId!.Value, messageId, correlationId);
         }
+        catch (Exception exception)
+        {
+            if (settlement is not null)
+            {
+                CloudOrdersTelemetry.RecordMessageSettlement(
+                    ConsumerIdentities.Notification,
+                    settlement,
+                    "failed");
+            }
 
-        await completeMessageAsync(cancellationToken).ConfigureAwait(false);
-
-        LogCompletedNotification(orderId!.Value, messageId, correlationId);
+            CloudOrdersTelemetry.SetFailure(activity, exception);
+            LogNotificationProcessingFailed(exception, exception.GetType().Name, orderId);
+            throw;
+        }
+        finally
+        {
+            CloudOrdersTelemetry.RecordMessageProcessing(
+                ConsumerIdentities.Notification,
+                outcome,
+                Stopwatch.GetElapsedTime(startedAt).TotalSeconds);
+        }
     }
 
     private static void ValidateMessageContract(string? subject, string? contentType)
@@ -142,8 +206,9 @@ internal sealed partial class NotificationMessageProcessor(
 
     [LoggerMessage(
         Level = LogLevel.Warning,
-        Message = "Dead-lettered notification message {MessageId} with correlation {CorrelationId} and reason {DeadLetterReason}.")]
+        Message = "Dead-lettered notification message {MessageId} for order {OrderId} with correlation {CorrelationId} and reason {DeadLetterReason}.")]
     private partial void LogDeadLetteredNotification(
+        Guid? orderId,
         string messageId,
         string? correlationId,
         string deadLetterReason);
@@ -155,4 +220,9 @@ internal sealed partial class NotificationMessageProcessor(
         Guid orderId,
         string messageId,
         string? correlationId);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Notification message processing failed for order {OrderId} with {FailureType}.")]
+    private partial void LogNotificationProcessingFailed(Exception exception, string failureType, Guid? orderId);
 }

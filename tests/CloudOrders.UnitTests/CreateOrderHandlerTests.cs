@@ -1,6 +1,9 @@
+using System.Diagnostics;
 using CloudOrders.Application.Messaging;
+using CloudOrders.Application.Observability;
 using CloudOrders.Application.Orders;
 using CloudOrders.Domain.Orders;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CloudOrders.UnitTests;
 
@@ -13,7 +16,7 @@ public sealed class CreateOrderHandlerTests
         var store = new CapturingOrderStore(calls);
         var publisher = new CapturingMessagePublisher(calls);
         var time = new FixedTimeProvider(new DateTimeOffset(2026, 9, 7, 12, 0, 0, TimeSpan.Zero));
-        var handler = new CreateOrderHandler(store, publisher, time);
+        var handler = new CreateOrderHandler(store, publisher, time, NullLogger<CreateOrderHandler>.Instance);
 
         var result = await handler.HandleAsync(new CreateOrderCommand("customer-123"));
 
@@ -44,7 +47,7 @@ public sealed class CreateOrderHandlerTests
             AddException = new InvalidOperationException("Persistence failed.")
         };
         var publisher = new CapturingMessagePublisher();
-        var handler = new CreateOrderHandler(store, publisher, TimeProvider.System);
+        var handler = new CreateOrderHandler(store, publisher, TimeProvider.System, NullLogger<CreateOrderHandler>.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => handler.HandleAsync(new CreateOrderCommand("customer-123")));
@@ -61,13 +64,43 @@ public sealed class CreateOrderHandlerTests
         {
             PublishException = new InvalidOperationException("Publishing failed.")
         };
-        var handler = new CreateOrderHandler(store, publisher, TimeProvider.System);
+        var handler = new CreateOrderHandler(store, publisher, TimeProvider.System, NullLogger<CreateOrderHandler>.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => handler.HandleAsync(new CreateOrderCommand("customer-123")));
 
         Assert.NotNull(store.Order);
         Assert.IsType<OrderCreated>(publisher.Payload);
+    }
+
+    [Fact]
+    public async Task HandleAsyncCreatesTraceWithOrderMessageAndCorrelationIdentifiers()
+    {
+        Activity? captured = null;
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == CloudOrdersTelemetry.ActivitySourceName,
+            Sample = static (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => captured = activity
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        var store = new CapturingOrderStore();
+        var publisher = new CapturingMessagePublisher();
+        var handler = new CreateOrderHandler(
+            store,
+            publisher,
+            TimeProvider.System,
+            NullLogger<CreateOrderHandler>.Instance);
+
+        var created = await handler.HandleAsync(new CreateOrderCommand("customer-123"));
+        var metadata = Assert.IsType<MessageMetadata>(publisher.Metadata);
+
+        Assert.NotNull(captured);
+        Assert.Equal("cloudorders.order.create", captured!.OperationName);
+        Assert.Equal(created.Id.ToString("D"), captured.GetTagItem("cloudorders.order.id"));
+        Assert.Equal(metadata.MessageId, captured.GetTagItem("messaging.message.id"));
+        Assert.Equal(metadata.CorrelationId, captured.GetTagItem("messaging.conversation.id"));
     }
 
     [Fact]

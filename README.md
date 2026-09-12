@@ -142,6 +142,20 @@ Invoke-RestMethod "http://localhost:5049/orders/$($order.id)"
 
 On successful `POST /orders`, the API returns `201 Created` only after the order has been persisted and its `OrderCreated` message has been accepted by the configured Service Bus publisher. The message uses subject `CloudOrders.Orders.OrderCreated`, content type `application/json`, a generated native `MessageId`, and the created order ID as native `CorrelationId`. Its JSON payload contains only `orderId`, `customerId`, `status`, and `createdAtUtc`; `status` is the stable integration value `Pending`, not a serialized domain enum.
 
+### Observability
+
+The API and Payment, Inventory, and Notification Workers emit JSON console logs with structured `Service`, `Operation`, `OrderId`, `MessageId`, `CorrelationId`, `TraceId`, `SpanId`, `Consumer`, `Outcome`, and `DeliveryCount` properties where each value is available. They also emit OpenTelemetry traces and low-cardinality metrics for order persistence/publication, message outcomes, settlement, redelivery, processor errors, PostgreSQL/Npgsql, EF Core, ASP.NET Core, and .NET runtime behavior. Message bodies, customer payloads, credentials, connection strings, and SQL parameter values are not logged or attached as telemetry attributes.
+
+Development defaults to the console trace and metrics exporter. Set `Observability__Exporter=Otlp` and the standard `OTEL_EXPORTER_OTLP_*` variables to send telemetry to a developer-provided local collector; `Observability__Exporter=None` disables exporters and is the default outside Development, including automated integration tests. No collector, dashboard, or alerting stack is included in Docker Compose.
+
+The repository resolves `Azure.Messaging.ServiceBus` 7.20.2. Its package documentation confirms that its ActivitySource remains experimental and feature-flag gated, so include SDK-level send/process/settlement spans by setting the documented environment variable before starting the API or business workers:
+
+```powershell
+$env:AZURE_EXPERIMENTAL_ENABLE_ACTIVITY_SOURCE = "true"
+```
+
+No `AppContext` switch is used. When that variable is absent, CloudOrders application spans and metrics continue to work, but Service Bus SDK transport spans are not expected. A future Azure deployment can replace the local exporter configuration with Azure Monitor OpenTelemetry configuration without changing business or message-processing code.
+
 ### Temporary persistence and publish consistency
 
 This increment does not use an Outbox Pattern. If PostgreSQL commits the order but Service Bus publishing subsequently fails, the API request fails with its standard server-error behavior while the order remains persisted and no delivery guarantee exists for its event. Retrying the request can create another order because request idempotency is also deferred. Publisher retry, delivery recovery, and Outbox behavior remain future work.
@@ -224,4 +238,4 @@ dotnet test tests/CloudOrders.IntegrationTests
 
 Messaging serialization, payment, inventory, and notification processing, and order-publication tests do not require Azure. The end-to-end Service Bus check is the documented simultaneous Payment/Inventory/Notification smoke flow above and requires a developer-provisioned namespace; it is intentionally separate from normal automated tests.
 
-Real email or SMS providers, notification persistence, DLQ replay/recovery tooling, provider-specific retry policy, a real payment gateway, real inventory system, payment or inventory persistence, Outbox, observability, Azure deployment, Key Vault, Managed Identity implementation, IaC, API containerization, and CI/CD remain deferred to future OpenSpec changes.
+Real email or SMS providers, notification persistence, DLQ replay/recovery tooling, provider-specific retry policy, a real payment gateway, real inventory system, payment or inventory persistence, Outbox, Azure deployment, Key Vault, Managed Identity implementation, IaC, API containerization, production dashboards or alerts, and CI/CD remain deferred to future OpenSpec changes.

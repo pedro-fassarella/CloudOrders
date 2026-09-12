@@ -1,5 +1,8 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Text.Json;
 using CloudOrders.Application.Messaging;
+using CloudOrders.Application.Observability;
 using CloudOrders.Payment.Worker;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -313,6 +316,61 @@ public sealed class PaymentMessageProcessorTests
 
         Assert.Null(paymentProcessor.OrderCreated);
         Assert.Equal(0, completions);
+    }
+
+    [Fact]
+    public async Task ProcessAsyncEmitsCorrelatedWorkerTraceAndLowCardinalityMetrics()
+    {
+        Activity? captured = null;
+        var metricTags = new List<KeyValuePair<string, object?>[]>();
+
+        using var activityListener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == CloudOrdersTelemetry.ActivitySourceName,
+            Sample = static (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => captured = activity
+        };
+        ActivitySource.AddActivityListener(activityListener);
+
+        using var meterListener = new MeterListener();
+        meterListener.InstrumentPublished = (instrument, listener) =>
+        {
+            if (instrument.Meter.Name == CloudOrdersTelemetry.MeterName)
+            {
+                listener.EnableMeasurementEvents(instrument);
+            }
+        };
+        meterListener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var copiedTags = new KeyValuePair<string, object?>[tags.Length];
+            tags.CopyTo(copiedTags);
+            metricTags.Add(copiedTags);
+        });
+        meterListener.Start();
+
+        var orderCreated = CreateOrderCreated(OrderCreated.PendingStatus);
+        var processor = CreateMessageProcessor(new CapturingPaymentProcessor());
+
+        await processor.ProcessAsync(
+            Serialize(orderCreated),
+            "message-observability",
+            orderCreated.OrderId.ToString("D"),
+            OrderCreated.Subject,
+            OrderCreated.JsonContentType,
+            _ => Task.CompletedTask,
+            deliveryCount: 2);
+
+        Assert.NotNull(captured);
+        Assert.Equal("cloudorders.messaging.process", captured!.OperationName);
+        Assert.Equal(ConsumerIdentities.Payment, captured.GetTagItem("cloudorders.consumer"));
+        Assert.Equal(orderCreated.OrderId.ToString("D"), captured.GetTagItem("cloudorders.order.id"));
+        Assert.Equal("message-observability", captured.GetTagItem("messaging.message.id"));
+        Assert.Equal(orderCreated.OrderId.ToString("D"), captured.GetTagItem("messaging.conversation.id"));
+        Assert.Equal("processed", captured.GetTagItem("cloudorders.outcome"));
+        Assert.NotEmpty(metricTags);
+        Assert.All(
+            metricTags.SelectMany(tags => tags),
+            tag => Assert.DoesNotContain("id", tag.Key, StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

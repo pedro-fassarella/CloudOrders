@@ -1,5 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using Azure.Messaging.ServiceBus;
+using CloudOrders.Application.Messaging;
+using CloudOrders.Application.Observability;
 using CloudOrders.Infrastructure.Messaging;
 
 namespace CloudOrders.Payment.Worker;
@@ -28,9 +30,20 @@ internal sealed partial class ServiceBusPaymentWorker(
 
         await using (processor.ConfigureAwait(false))
         {
+            using var scope = CloudOrdersTelemetry.BeginProcessorScope(
+                logger,
+                CloudOrdersTelemetry.PaymentWorkerServiceName,
+                ConsumerIdentities.Payment);
             processor.ProcessMessageAsync += ProcessMessageAsync;
             processor.ProcessErrorAsync += args =>
             {
+                using var errorScope = CloudOrdersTelemetry.BeginProcessorScope(
+                    logger,
+                    CloudOrdersTelemetry.PaymentWorkerServiceName,
+                    ConsumerIdentities.Payment);
+                CloudOrdersTelemetry.RecordProcessorError(
+                    ConsumerIdentities.Payment,
+                    args.ErrorSource.ToString());
                 LogProcessorError(args.Exception, args.ErrorSource, args.EntityPath);
                 return Task.CompletedTask;
             };
@@ -66,7 +79,8 @@ internal sealed partial class ServiceBusPaymentWorker(
                 details.Reason,
                 details.Description,
                 cancellationToken),
-            args.CancellationToken);
+            args.CancellationToken,
+            args.Message.DeliveryCount);
     }
 
     [LoggerMessage(

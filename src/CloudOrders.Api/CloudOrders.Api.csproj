@@ -21,4 +21,6 @@
     <ProjectReference Include="..\CloudOrders.Infrastructure\CloudOrders.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ProjectExtensions><VisualStudio><UserProperties properties_4launchsettings_1json__JsonSchema="https://nexte.st/schemas/repo-config.json" /></VisualStudio></ProjectExtensions>
+
 </Project>

@@ -1,8 +1,10 @@
 using CloudOrders.Application;
 using CloudOrders.Application.Messaging;
+using CloudOrders.Application.Observability;
 using CloudOrders.Application.Orders;
 using CloudOrders.Infrastructure;
 using CloudOrders.Infrastructure.Messaging;
+using CloudOrders.Infrastructure.Observability;
 using CloudOrders.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -14,6 +16,11 @@ builder.Services.AddProblemDetails();
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(builder.Configuration);
 builder.Services.AddServiceBusPublisher(builder.Configuration);
+builder.Services.AddCloudOrdersObservability(
+    builder.Configuration,
+    builder.Environment,
+    CloudOrdersTelemetry.ApiServiceName,
+    includeAspNetCoreInstrumentation: true);
 
 var app = builder.Build();
 
