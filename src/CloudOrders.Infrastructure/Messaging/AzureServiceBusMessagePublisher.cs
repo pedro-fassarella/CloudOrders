@@ -5,6 +5,15 @@ namespace CloudOrders.Infrastructure.Messaging;
 
 internal sealed class AzureServiceBusMessagePublisher(ServiceBusSender sender) : IMessagePublisher
 {
+    public Task PublishAsync(
+        OutboundMessage message,
+        CancellationToken cancellationToken = default)
+    {
+        return sender.SendMessageAsync(
+            ServiceBusMessageFactory.Create(message),
+            cancellationToken);
+    }
+
     public Task PublishAsync<TPayload>(
         TPayload payload,
         MessageMetadata metadata,

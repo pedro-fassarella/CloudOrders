@@ -8,6 +8,10 @@ public sealed record MessageMetadata(
 
 public interface IMessagePublisher
 {
+    Task PublishAsync(
+        OutboundMessage message,
+        CancellationToken cancellationToken = default);
+
     Task PublishAsync<TPayload>(
         TPayload payload,
         MessageMetadata metadata,

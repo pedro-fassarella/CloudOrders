@@ -15,14 +15,18 @@ public sealed record CreatedOrder(
 
 public interface IOrderStore
 {
-    Task AddAsync(Order order, CancellationToken cancellationToken = default);
+    Task AddWithOutboxAsync(
+        Order order,
+        OrderCreated orderCreated,
+        MessageMetadata metadata,
+        OutboxTraceContext? traceContext,
+        CancellationToken cancellationToken = default);
 
     Task<Order?> GetByIdAsync(Guid id, CancellationToken cancellationToken = default);
 }
 
 public sealed partial class CreateOrderHandler(
     IOrderStore orderStore,
-    IMessagePublisher publisher,
     TimeProvider timeProvider,
     ILogger<CreateOrderHandler> logger)
 {
@@ -57,20 +61,30 @@ public sealed partial class CreateOrderHandler(
             order.Id,
             metadata.MessageId,
             metadata.CorrelationId);
+        var traceContext = CloudOrdersTelemetry.CaptureTraceContext(activity);
+        using var persistenceActivity = CloudOrdersTelemetry.StartOutboxPersistence(
+            order.Id,
+            metadata.MessageId,
+            metadata.CorrelationId);
 
         try
         {
-            await orderStore.AddAsync(order, cancellationToken).ConfigureAwait(false);
+            await orderStore.AddWithOutboxAsync(
+                    order,
+                    orderCreated,
+                    metadata,
+                    traceContext,
+                    cancellationToken)
+                .ConfigureAwait(false);
             CloudOrdersTelemetry.RecordOrderPersisted();
-            LogOrderPersisted();
-
-            await publisher.PublishAsync(orderCreated, metadata, cancellationToken).ConfigureAwait(false);
-            CloudOrdersTelemetry.RecordOrderPublished();
-            LogOrderPublished();
-            CloudOrdersTelemetry.SetOutcome(activity, "published");
+            CloudOrdersTelemetry.RecordOutboxPersisted();
+            CloudOrdersTelemetry.SetOutcome(persistenceActivity, "enqueued");
+            CloudOrdersTelemetry.SetOutcome(activity, "enqueued");
+            LogOrderAndOutboxPersisted();
         }
         catch (Exception exception)
         {
+            CloudOrdersTelemetry.SetFailure(persistenceActivity, exception);
             CloudOrdersTelemetry.SetFailure(activity, exception);
             LogOrderCreationFailed(exception, exception.GetType().Name);
             throw;
@@ -94,13 +108,8 @@ public sealed partial class CreateOrderHandler(
 
     [LoggerMessage(
         Level = LogLevel.Information,
-        Message = "Persisted order before publishing OrderCreated.")]
-    private partial void LogOrderPersisted();
-
-    [LoggerMessage(
-        Level = LogLevel.Information,
-        Message = "Published OrderCreated after order persistence.")]
-    private partial void LogOrderPublished();
+        Message = "Persisted order and queued OrderCreated in the transactional outbox.")]
+    private partial void LogOrderAndOutboxPersisted();
 
     [LoggerMessage(
         Level = LogLevel.Warning,

@@ -1,5 +1,6 @@
 using Azure.Messaging.ServiceBus;
 using CloudOrders.Application.Messaging;
+using CloudOrders.Infrastructure.Persistence;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -43,6 +44,25 @@ public static class ServiceBusServiceCollectionExtensions
             return client.CreateSender(options.TopicName);
         });
         services.AddSingleton<IMessagePublisher, AzureServiceBusMessagePublisher>();
+
+        return services;
+    }
+
+    public static IServiceCollection AddOutboxDispatcher(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var options = OutboxDispatcherOptions.FromConfiguration(configuration);
+        services.AddSingleton(options);
+        services.AddScoped<IOutboxMessageStore, EfOutboxMessageStore>();
+
+        if (options.Enabled)
+        {
+            services.AddHostedService<OutboxDispatcherHostedService>();
+        }
 
         return services;
     }

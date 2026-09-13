@@ -1,14 +1,30 @@
 # Observability Specification
 
-## Requirement: Correlated order telemetry
+## Requirement: Correlated order and outbox telemetry
 
 The API MUST create application telemetry for an accepted order creation that identifies the order, native message, and business correlation without placing those identifiers in metric dimensions.
 
 #### Scenario: Create an order
 
-- **WHEN** `POST /orders` persists an order and publishes `OrderCreated`
+- **WHEN** `POST /orders` commits an order and its `OrderCreated` outbox row
 - **THEN** the application trace includes `OrderId`, `MessageId`, and `CorrelationId`
-- **AND** persisted and published counters are recorded without customer or identifier attributes.
+- **AND** it records outbox persistence telemetry without customer or identifier metric attributes.
+
+#### Scenario: Dispatch a pending outbox row
+
+- **WHEN** the API-hosted dispatcher sends an outbox message
+- **THEN** it emits correlated dispatch tracing, structured logs, and low-cardinality pending/attempt metrics
+- **AND** it marks the row published only after Service Bus confirms the send.
+
+## Requirement: Delayed W3C trace continuity
+
+The API MUST persist optional W3C trace context as outbox metadata and MUST NOT add it to the `OrderCreated` business payload.
+
+#### Scenario: Dispatch with stored trace context
+
+- **WHEN** a pending outbox row contains valid traceparent and tracestate metadata
+- **THEN** the dispatcher starts its activity with that context as parent
+- **AND** the event JSON contract remains unchanged.
 
 ## Requirement: Business-worker observability
 

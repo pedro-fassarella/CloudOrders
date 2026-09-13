@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Json;
 using CloudOrders.Application.Messaging;
+using CloudOrders.Application.Orders;
+using CloudOrders.Domain.Orders;
 using CloudOrders.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -68,7 +70,7 @@ public sealed class OrdersApiTests(PostgreSqlFixture database) : IClassFixture<P
     }
 
     [Fact]
-    public async Task CreatedOrderPublishesOrderCreatedEvent()
+    public async Task CreatedOrderPersistsPendingOutboxWithoutDirectPublication()
     {
         using var factory = new IntegrationTestFactory(database.ConnectionString);
         using var client = factory.CreateClient();
@@ -82,16 +84,70 @@ public sealed class OrdersApiTests(PostgreSqlFixture database) : IClassFixture<P
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         Assert.NotNull(created);
 
-        var published = Assert.IsType<OrderCreated>(publisher.Payload);
-        var metadata = Assert.IsType<MessageMetadata>(publisher.Metadata);
-        Assert.Equal(created!.Id, published.OrderId);
-        Assert.Equal(created.CustomerId, published.CustomerId);
-        Assert.Equal(OrderCreated.PendingStatus, published.Status);
-        Assert.Equal(created.CreatedAtUtc.ToUnixTimeMilliseconds(), published.CreatedAtUtc.ToUnixTimeMilliseconds());
-        Assert.True(Guid.TryParse(metadata.MessageId, out _));
-        Assert.Equal(created.Id.ToString("D"), metadata.CorrelationId);
-        Assert.Equal(OrderCreated.Subject, metadata.Subject);
-        Assert.Equal(OrderCreated.JsonContentType, metadata.ContentType);
+        Assert.Equal(0, publisher.CallCount);
+
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<CloudOrdersDbContext>();
+        var outbox = await db.OutboxMessages.SingleAsync(item => item.OrderId == created!.Id).ConfigureAwait(true);
+        var persisted = System.Text.Json.JsonSerializer.Deserialize<OrderCreated>(
+            outbox.PayloadJson,
+            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web));
+
+        Assert.NotNull(persisted);
+        Assert.Equal(created.Id, persisted!.OrderId);
+        Assert.Equal(created.CustomerId, persisted.CustomerId);
+        Assert.Equal(OrderCreated.PendingStatus, persisted.Status);
+        Assert.Equal(created.CreatedAtUtc.ToUnixTimeMilliseconds(), persisted.CreatedAtUtc.ToUnixTimeMilliseconds());
+        Assert.True(Guid.TryParse(outbox.MessageId, out _));
+        Assert.Equal(created.Id.ToString("D"), outbox.CorrelationId);
+        Assert.Equal(OrderCreated.Subject, outbox.Subject);
+        Assert.Equal(OrderCreated.JsonContentType, outbox.ContentType);
+        Assert.Null(outbox.PublishedAtUtc);
+        Assert.DoesNotContain("traceparent", outbox.PayloadJson, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task FailedOutboxInsertRollsBackTheOrderInsert()
+    {
+        using var factory = new IntegrationTestFactory(database.ConnectionString);
+        using var firstScope = factory.Services.CreateScope();
+        var store = firstScope.ServiceProvider.GetRequiredService<IOrderStore>();
+        var timestamp = new DateTimeOffset(2026, 9, 12, 18, 0, 0, TimeSpan.Zero);
+        var metadata = new MessageMetadata(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000001",
+            OrderCreated.Subject,
+            OrderCreated.JsonContentType);
+        var firstOrder = Order.Create(
+            Guid.Parse("00000000-0000-0000-0000-000000000001"),
+            "first-customer",
+            timestamp);
+        var firstEvent = new OrderCreated(
+            firstOrder.Id,
+            firstOrder.CustomerId,
+            OrderCreated.PendingStatus,
+            timestamp);
+
+        await store.AddWithOutboxAsync(firstOrder, firstEvent, metadata, null).ConfigureAwait(true);
+
+        var secondOrder = Order.Create(
+            Guid.Parse("00000000-0000-0000-0000-000000000002"),
+            "second-customer",
+            timestamp);
+        var secondEvent = new OrderCreated(
+            secondOrder.Id,
+            secondOrder.CustomerId,
+            OrderCreated.PendingStatus,
+            timestamp);
+
+        await Assert.ThrowsAsync<DbUpdateException>(
+            () => store.AddWithOutboxAsync(secondOrder, secondEvent, metadata, null));
+
+        using var verificationScope = factory.Services.CreateScope();
+        var db = verificationScope.ServiceProvider.GetRequiredService<CloudOrdersDbContext>();
+        Assert.NotNull(await db.Orders.SingleOrDefaultAsync(order => order.Id == firstOrder.Id).ConfigureAwait(true));
+        Assert.Null(await db.Orders.SingleOrDefaultAsync(order => order.Id == secondOrder.Id).ConfigureAwait(true));
+        Assert.Single(await db.OutboxMessages.ToListAsync().ConfigureAwait(true));
     }
 
     [Fact]
@@ -127,7 +183,8 @@ internal sealed class IntegrationTestFactory(string connectionString)
         {
             configuration.AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["ConnectionStrings:Postgres"] = connectionString
+                ["ConnectionStrings:Postgres"] = connectionString,
+                ["Outbox:Enabled"] = "false"
             });
         });
         builder.ConfigureServices(services =>
@@ -142,17 +199,20 @@ internal sealed class IntegrationTestFactory(string connectionString)
 
 internal sealed class CapturingMessagePublisher : IMessagePublisher
 {
-    public object? Payload { get; private set; }
+    public int CallCount { get; private set; }
 
-    public MessageMetadata? Metadata { get; private set; }
+    public Task PublishAsync(OutboundMessage message, CancellationToken cancellationToken = default)
+    {
+        CallCount++;
+        return Task.CompletedTask;
+    }
 
     public Task PublishAsync<TPayload>(
         TPayload payload,
         MessageMetadata metadata,
         CancellationToken cancellationToken = default)
     {
-        Payload = payload;
-        Metadata = metadata;
+        CallCount++;
         return Task.CompletedTask;
     }
 }

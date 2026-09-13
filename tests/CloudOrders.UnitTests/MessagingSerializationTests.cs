@@ -53,4 +53,24 @@ public sealed class MessagingSerializationTests
         Assert.Equal(metadata.ContentType, message.ContentType);
         Assert.Equal(orderCreated, roundTrip);
     }
+
+    [Fact]
+    public void ServiceBusMessagePreservesOutboundMessagePayloadAndNativeMetadata()
+    {
+        var payload = "{\"orderId\":\"00000000-0000-0000-0000-000000000001\"}"u8.ToArray();
+        var outbound = new OutboundMessage(
+            "message-123",
+            "correlation-456",
+            OrderCreated.Subject,
+            OrderCreated.JsonContentType,
+            payload);
+
+        var message = ServiceBusMessageFactory.Create(outbound);
+
+        Assert.Equal(outbound.MessageId, message.MessageId);
+        Assert.Equal(outbound.CorrelationId, message.CorrelationId);
+        Assert.Equal(outbound.Subject, message.Subject);
+        Assert.Equal(outbound.ContentType, message.ContentType);
+        Assert.Equal(payload, message.Body.ToArray());
+    }
 }

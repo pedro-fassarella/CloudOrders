@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Collections.Concurrent;
 using System.Text.Json;
 using CloudOrders.Application.Messaging;
 using CloudOrders.Application.Observability;
@@ -322,7 +323,7 @@ public sealed class PaymentMessageProcessorTests
     public async Task ProcessAsyncEmitsCorrelatedWorkerTraceAndLowCardinalityMetrics()
     {
         Activity? captured = null;
-        var metricTags = new List<KeyValuePair<string, object?>[]>();
+        var metricTags = new ConcurrentQueue<KeyValuePair<string, object?>[]>();
 
         using var activityListener = new ActivityListener
         {
@@ -344,7 +345,7 @@ public sealed class PaymentMessageProcessorTests
         {
             var copiedTags = new KeyValuePair<string, object?>[tags.Length];
             tags.CopyTo(copiedTags);
-            metricTags.Add(copiedTags);
+            metricTags.Enqueue(copiedTags);
         });
         meterListener.Start();
 

@@ -82,4 +82,4 @@ The processed-state implementation MUST coordinate the claim, current simulated 
 - **THEN** a later delivery skips the business processor using the durable completed state
 - **AND** the later delivery can safely retry Service Bus completion.
 
-The current simulated processors have no external side effects. Exactly-once coordination with future external providers remains deferred until a transactional business-state or Outbox design exists.
+The current simulated processors have no external side effects. OrderCreated publication uses the transactional outbox, while exactly-once coordination with future external providers remains deferred.

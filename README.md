@@ -1,6 +1,6 @@
 # CloudOrders
 
-CloudOrders is a .NET 10 walking skeleton for an event-driven order-processing project. It proves the HTTP, application, domain and PostgreSQL persistence flow, publishes the real `OrderCreated` integration event through Azure Service Bus, and retains a Development-only messaging probe for transport diagnostics.
+CloudOrders is a .NET 10 walking skeleton for an event-driven order-processing project. It proves the HTTP, application, domain and PostgreSQL persistence flow, durably dispatches the real `OrderCreated` integration event through Azure Service Bus, and retains a Development-only messaging probe for transport diagnostics.
 
 ## Prerequisites
 
@@ -47,7 +47,7 @@ The standard .NET configuration order is committed appsettings, then User Secret
 
 ### Configure Service Bus messaging
 
-`POST /orders` persists an order and then publishes an `OrderCreated` JSON message to topic `order-events`. `CloudOrders.Payment.Worker`, `CloudOrders.Inventory.Worker`, and `CloudOrders.Notification.Worker` consume independent filtered copies from `payment`, `inventory`, and `notification`: Payment performs deterministic simulated payment, Inventory performs deterministic simulated reservation, and Notification performs deterministic simulated notification for the current `Pending` flow. Each logs `OrderId`, `MessageId`, and `CorrelationId`, logs its deterministic reference, and explicitly completes only its successful subscription message. The Development-only `POST /messaging/probe` endpoint and `CloudOrders.Messaging.Worker` remain independent transport diagnostics on `messaging-probe`.
+`POST /orders` commits the order and a pending `OrderCreated` outbox message in one PostgreSQL transaction. The API-hosted Outbox Dispatcher later publishes the stored JSON message to topic `order-events`. `CloudOrders.Payment.Worker`, `CloudOrders.Inventory.Worker`, and `CloudOrders.Notification.Worker` consume independent filtered copies from `payment`, `inventory`, and `notification`: Payment performs deterministic simulated payment, Inventory performs deterministic simulated reservation, and Notification performs deterministic simulated notification for the current `Pending` flow. Each logs `OrderId`, `MessageId`, and `CorrelationId`, logs its deterministic reference, and explicitly completes only its successful subscription message. The Development-only `POST /messaging/probe` endpoint and `CloudOrders.Messaging.Worker` remain independent transport diagnostics on `messaging-probe`.
 
 This setup uses a real Azure Service Bus namespace. It is separate from Docker Compose, and no Service Bus secret belongs in `.env` or committed appsettings.
 
@@ -116,7 +116,9 @@ dotnet user-secrets set --project src/CloudOrders.Notification.Worker "Connectio
 
 The inbox uses the native Service Bus `MessageId` plus a centralized logical consumer identity. After a worker has committed a message as processed, a redelivery for that same worker skips the simulation and is completed safely. Payment, Inventory, and Notification each retain an independent inbox key for the same event. This protects the current deterministic local simulations; it is not a distributed exactly-once guarantee for future external providers.
 
-`Messaging:TopicName` and `Messaging:SubscriptionName` have safe committed defaults. `ConnectionStrings__ServiceBus`, `Messaging__TopicName`, and `Messaging__SubscriptionName` can override them through environment variables. Managed Identity with Azure Service Bus RBAC is the intended deployment direction, but is not implemented in this increment.
+`Messaging:TopicName` and `Messaging:SubscriptionName` have safe committed defaults. The API also configures `Outbox:Enabled=true`, `Outbox:BatchSize=20`, and `Outbox:PollingIntervalSeconds=5`; environment variables such as `Outbox__BatchSize` override them. Initial deployment supports exactly one active Outbox Dispatcher instance. When the API is scaled, enable the dispatcher on one replica only and set `Outbox:Enabled=false` on every other replica. Stable MessageIds and idempotent consumers make duplicate delivery safe, but they do not coordinate concurrent dispatchers.
+
+`ConnectionStrings__ServiceBus`, `Messaging__TopicName`, and `Messaging__SubscriptionName` can override Service Bus settings through environment variables. Managed Identity with Azure Service Bus RBAC is the intended deployment direction, but is not implemented in this increment.
 
 ### Apply migrations
 
@@ -140,11 +142,11 @@ $order = Invoke-RestMethod -Method Post -Uri http://localhost:5049/orders -Conte
 Invoke-RestMethod "http://localhost:5049/orders/$($order.id)"
 ```
 
-On successful `POST /orders`, the API returns `201 Created` only after the order has been persisted and its `OrderCreated` message has been accepted by the configured Service Bus publisher. The message uses subject `CloudOrders.Orders.OrderCreated`, content type `application/json`, a generated native `MessageId`, and the created order ID as native `CorrelationId`. Its JSON payload contains only `orderId`, `customerId`, `status`, and `createdAtUtc`; `status` is the stable integration value `Pending`, not a serialized domain enum.
+On successful `POST /orders`, the API returns `201 Created` after the order and its `OrderCreated` outbox row have committed together. It does not wait for Service Bus. The dispatcher later uses the persisted subject `CloudOrders.Orders.OrderCreated`, content type `application/json`, stable native `MessageId`, and created order ID as native `CorrelationId`. Its JSON payload contains only `orderId`, `customerId`, `status`, and `createdAtUtc`; `status` is the stable integration value `Pending`, not a serialized domain enum.
 
 ### Observability
 
-The API and Payment, Inventory, and Notification Workers emit JSON console logs with structured `Service`, `Operation`, `OrderId`, `MessageId`, `CorrelationId`, `TraceId`, `SpanId`, `Consumer`, `Outcome`, and `DeliveryCount` properties where each value is available. They also emit OpenTelemetry traces and low-cardinality metrics for order persistence/publication, message outcomes, settlement, redelivery, processor errors, PostgreSQL/Npgsql, EF Core, ASP.NET Core, and .NET runtime behavior. Message bodies, customer payloads, credentials, connection strings, and SQL parameter values are not logged or attached as telemetry attributes.
+The API and Payment, Inventory, and Notification Workers emit JSON console logs with structured `Service`, `Operation`, `OrderId`, `MessageId`, `CorrelationId`, `TraceId`, `SpanId`, `Consumer`, `Outcome`, and `DeliveryCount` properties where each value is available. The API adds outbox persistence and dispatch spans, persists W3C trace context as outbox metadata rather than business payload, and emits low-cardinality pending and dispatch-attempt metrics. Message bodies, customer payloads, credentials, connection strings, exception messages, and SQL parameter values are not logged or attached as telemetry attributes.
 
 Development defaults to the console trace and metrics exporter. Set `Observability__Exporter=Otlp` and the standard `OTEL_EXPORTER_OTLP_*` variables to send telemetry to a developer-provided local collector; `Observability__Exporter=None` disables exporters and is the default outside Development, including automated integration tests. No collector, dashboard, or alerting stack is included in Docker Compose.
 
@@ -156,9 +158,13 @@ $env:AZURE_EXPERIMENTAL_ENABLE_ACTIVITY_SOURCE = "true"
 
 No `AppContext` switch is used. When that variable is absent, CloudOrders application spans and metrics continue to work, but Service Bus SDK transport spans are not expected. A future Azure deployment can replace the local exporter configuration with Azure Monitor OpenTelemetry configuration without changing business or message-processing code.
 
-### Temporary persistence and publish consistency
+### Transactional outbox dispatch
 
-This increment does not use an Outbox Pattern. If PostgreSQL commits the order but Service Bus publishing subsequently fails, the API request fails with its standard server-error behavior while the order remains persisted and no delivery guarantee exists for its event. Retrying the request can create another order because request idempotency is also deferred. Publisher retry, delivery recovery, and Outbox behavior remain future work.
+The outbox row stores the serialized `OrderCreated` payload, native Service Bus metadata, stable MessageId, attempt metadata, and optional W3C trace context in the same transaction as the Order. The dispatcher sends pending rows oldest first, marks them published only after Service Bus confirms the send, and does not delete published rows.
+
+If sending fails, the row remains pending for a later polling attempt. If Service Bus confirms a send but the database update fails or the process stops first, the row remains pending and can be sent again with the same MessageId. Payment, Inventory, and Notification use their durable consumer-scoped inbox records to skip duplicate business execution safely. This is at-least-once publication, not distributed exactly-once delivery.
+
+This initial dispatcher deliberately has no PostgreSQL claim, lease, `FOR UPDATE SKIP LOCKED`, or row-lock coordination. Run one active dispatcher instance only. Multi-instance dispatcher coordination, cleanup/retention, retry limits, poison handling, and replay remain future work.
 
 ### Run the Service Bus smoke flow
 
@@ -236,6 +242,6 @@ Integration tests start an isolated PostgreSQL 17 container through Testcontaine
 dotnet test tests/CloudOrders.IntegrationTests
 ```
 
-Messaging serialization, payment, inventory, and notification processing, and order-publication tests do not require Azure. The end-to-end Service Bus check is the documented simultaneous Payment/Inventory/Notification smoke flow above and requires a developer-provisioned namespace; it is intentionally separate from normal automated tests.
+Messaging serialization, outbox dispatcher, payment, inventory, notification processing, and order persistence tests do not require Azure. The end-to-end Service Bus check is the documented simultaneous Payment/Inventory/Notification smoke flow above and requires a developer-provisioned namespace; it is intentionally separate from normal automated tests.
 
-Real email or SMS providers, notification persistence, DLQ replay/recovery tooling, provider-specific retry policy, a real payment gateway, real inventory system, payment or inventory persistence, Outbox, Azure deployment, Key Vault, Managed Identity implementation, IaC, API containerization, production dashboards or alerts, and CI/CD remain deferred to future OpenSpec changes.
+Real email or SMS providers, notification persistence, DLQ replay/recovery tooling, provider-specific retry policy, a real payment gateway, real inventory system, payment or inventory persistence, multi-instance outbox coordination, outbox cleanup/retention, broker duplicate detection, Azure deployment, Key Vault, Managed Identity implementation, IaC, API containerization, production dashboards or alerts, and CI/CD remain deferred to future OpenSpec changes.

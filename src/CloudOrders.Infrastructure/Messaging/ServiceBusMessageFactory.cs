@@ -11,19 +11,30 @@ internal static class ServiceBusMessageFactory
     internal static ServiceBusMessage Create<TPayload>(TPayload payload, MessageMetadata metadata)
     {
         ArgumentNullException.ThrowIfNull(payload);
-        ArgumentNullException.ThrowIfNull(metadata);
-        ArgumentException.ThrowIfNullOrWhiteSpace(metadata.MessageId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(metadata.Subject);
-        ArgumentException.ThrowIfNullOrWhiteSpace(metadata.ContentType);
 
         var body = JsonSerializer.SerializeToUtf8Bytes(payload, SerializerOptions);
 
-        return new ServiceBusMessage(BinaryData.FromBytes(body))
+        return Create(new OutboundMessage(
+            metadata.MessageId,
+            metadata.CorrelationId,
+            metadata.Subject,
+            metadata.ContentType,
+            body));
+    }
+
+    internal static ServiceBusMessage Create(OutboundMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        ArgumentException.ThrowIfNullOrWhiteSpace(message.MessageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(message.Subject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(message.ContentType);
+
+        return new ServiceBusMessage(BinaryData.FromBytes(message.Payload))
         {
-            MessageId = metadata.MessageId,
-            CorrelationId = metadata.CorrelationId,
-            Subject = metadata.Subject,
-            ContentType = metadata.ContentType
+            MessageId = message.MessageId,
+            CorrelationId = message.CorrelationId,
+            Subject = message.Subject,
+            ContentType = message.ContentType
         };
     }
 }

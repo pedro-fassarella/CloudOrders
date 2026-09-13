@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using CloudOrders.Application.Messaging;
 using Microsoft.Extensions.Logging;
 
 namespace CloudOrders.Application.Observability;
@@ -22,6 +23,12 @@ public static class CloudOrdersTelemetry
     private static readonly Meter Meter = new(MeterName);
     private static readonly Counter<long> OrdersPersisted = Meter.CreateCounter<long>("cloudorders.orders.persisted");
     private static readonly Counter<long> OrdersPublished = Meter.CreateCounter<long>("cloudorders.orders.published");
+    private static readonly Counter<long> OutboxPersisted = Meter.CreateCounter<long>("cloudorders.outbox.persisted");
+    private static readonly Counter<long> OutboxDispatchAttempts = Meter.CreateCounter<long>("cloudorders.outbox.dispatch.attempts");
+    private static long outboxPendingCount;
+    private static readonly ObservableGauge<long> OutboxPending = Meter.CreateObservableGauge(
+        "cloudorders.outbox.pending",
+        () => Volatile.Read(ref outboxPendingCount));
     private static readonly Counter<long> MessagesProcessed = Meter.CreateCounter<long>("cloudorders.messaging.processed");
     private static readonly Histogram<double> MessageProcessingDuration = Meter.CreateHistogram<double>("cloudorders.messaging.processing.duration", "s");
     private static readonly Counter<long> MessageSettlements = Meter.CreateCounter<long>("cloudorders.messaging.settlements");
@@ -50,6 +57,47 @@ public static class CloudOrdersTelemetry
         return activity;
     }
 
+    public static Activity? StartOutboxPersistence(Guid orderId, string messageId, string? correlationId)
+    {
+        var activity = ActivitySource.StartActivity("cloudorders.outbox.persist", ActivityKind.Internal);
+        AddMessageTags(activity, orderId, messageId, correlationId);
+        return activity;
+    }
+
+    public static Activity? StartOutboxDispatch(
+        Guid orderId,
+        string messageId,
+        string? correlationId,
+        OutboxTraceContext? traceContext)
+    {
+        Activity? activity;
+
+        if (traceContext is not null && ActivityContext.TryParse(
+                traceContext.TraceParent,
+                traceContext.TraceState,
+                out var parentContext))
+        {
+            activity = ActivitySource.StartActivity(
+                "cloudorders.outbox.dispatch",
+                ActivityKind.Producer,
+                parentContext);
+        }
+        else
+        {
+            activity = ActivitySource.StartActivity("cloudorders.outbox.dispatch", ActivityKind.Producer);
+        }
+
+        AddMessageTags(activity, orderId, messageId, correlationId);
+        return activity;
+    }
+
+    public static OutboxTraceContext? CaptureTraceContext(Activity? activity)
+    {
+        return activity is { IdFormat: ActivityIdFormat.W3C, Id: not null }
+            ? new OutboxTraceContext(activity.Id, activity.TraceStateString)
+            : null;
+    }
+
     public static void AddOrderId(Activity? activity, Guid orderId)
     {
         activity?.SetTag("cloudorders.order.id", orderId.ToString("D"));
@@ -71,6 +119,18 @@ public static class CloudOrdersTelemetry
     public static void RecordOrderPersisted() => OrdersPersisted.Add(1);
 
     public static void RecordOrderPublished() => OrdersPublished.Add(1);
+
+    public static void RecordOutboxPersisted() => OutboxPersisted.Add(1);
+
+    public static void RecordOutboxDispatchAttempt(string outcome)
+    {
+        OutboxDispatchAttempts.Add(1, new TagList { { "outcome", outcome } });
+    }
+
+    public static void SetOutboxPendingCount(long count)
+    {
+        Interlocked.Exchange(ref outboxPendingCount, count);
+    }
 
     public static void RecordMessageProcessing(string consumer, string outcome, double durationSeconds)
     {
@@ -150,6 +210,23 @@ public static class CloudOrdersTelemetry
             messageId,
             correlationId,
             deliveryCount));
+    }
+
+    public static IDisposable? BeginOutboxScope(
+        ILogger logger,
+        string service,
+        Guid orderId,
+        string messageId,
+        string? correlationId)
+    {
+        return logger.BeginScope(CreateScope(
+            service,
+            "DispatchOutboxMessage",
+            consumer: null,
+            orderId,
+            messageId,
+            correlationId,
+            deliveryCount: null));
     }
 
     public static IDisposable? BeginProcessorScope(ILogger logger, string service, string consumer)

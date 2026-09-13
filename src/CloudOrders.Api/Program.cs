@@ -16,6 +16,7 @@ builder.Services.AddProblemDetails();
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(builder.Configuration);
 builder.Services.AddServiceBusPublisher(builder.Configuration);
+builder.Services.AddOutboxDispatcher(builder.Configuration);
 builder.Services.AddCloudOrdersObservability(
     builder.Configuration,
     builder.Environment,

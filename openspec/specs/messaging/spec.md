@@ -1,5 +1,15 @@
 # Messaging Specification
 
+## Requirement: Outbox transport preservation
+
+The OrderCreated outbox dispatcher MUST reconstruct a provider-neutral outbound envelope from persisted data and preserve the native Service Bus MessageId, CorrelationId, Subject, ContentType, and serialized payload.
+
+#### Scenario: Dispatch a stored OrderCreated event
+
+- **WHEN** the dispatcher sends a pending outbox row
+- **THEN** the received event uses the original MessageId and existing OrderCreated transport contract
+- **AND** the Development-only typed messaging probe remains unchanged.
+
 ## Requirement: Payment subscription isolation
 
 The `order-events` topic MUST have a dedicated `payment` subscription. Its `$Default` rule MUST be removed and it MUST use a SQL rule equivalent to `sys.Label = 'CloudOrders.Orders.OrderCreated'`.

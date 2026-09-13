@@ -13,13 +13,13 @@
 9. `add-idempotent-consumers`
 10. `add-retry-and-dead-letter-handling`
 11. `add-observability` (including the local Azure Service Bus smoke test)
+12. `add-outbox-pattern` (single active dispatcher instance)
 
 ## Next
 
-12. `add-outbox-pattern`
+13. `deploy-to-azure`
 
 ## Planned
 
-13. `deploy-to-azure`
 14. `add-ci-cd`
 15. `add-infrastructure-as-code`
